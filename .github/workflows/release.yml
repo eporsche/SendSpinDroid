@@ -63,7 +63,7 @@ jobs:
       if: env.SIGNING_ENABLED == 'false'
       run: |
         cd android
-        ./gradlew assembleRelease
+        ./gradlew assembleDebug
 
     - name: Get version from tag
       id: get_version
