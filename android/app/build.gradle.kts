@@ -59,11 +59,10 @@ android {
         applicationId = "com.sendspindroid"
 
         // minSdk: Minimum Android version supported
-        // API 26 = Android 8.0 Oreo (Aug 2017)
-        // Covers ~95% of active devices as of 2024
-        // Chosen for: AudioTrack improvements, better background execution
-        // TODO 2025: Consider raising to API 29 (Android 10) for security
-        minSdk = 26
+        // API 25 = Android 7.1 Nougat (Dec 2016)
+        // Covers ~96% of active devices as of 2024
+        // All required APIs available: AudioTrack, MediaSession, OkHttp
+        minSdk = 25
 
         // targetSdk 36 = Android 16
         targetSdk = 36
