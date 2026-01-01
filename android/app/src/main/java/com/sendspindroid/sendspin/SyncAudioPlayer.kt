@@ -1,7 +1,10 @@
 package com.sendspindroid.sendspin
 
+import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.os.Build
@@ -74,6 +77,7 @@ interface SyncAudioPlayerCallback {
  * ```
  */
 class SyncAudioPlayer(
+    private val context: Context,
     private val timeFilter: SendspinTimeFilter,
     private val sampleRate: Int = 48000,
     private val channels: Int = 2,
@@ -231,6 +235,14 @@ class SyncAudioPlayer(
             }
         }
 
+        // Check if device supports low-latency audio feature
+        val packageManager = context.packageManager
+        val hasLowLatency = packageManager.hasSystemFeature(PackageManager.FEATURE_AUDIO_LOW_LATENCY)
+        Log.i(TAG, "Device low-latency audio support: $hasLowLatency (API ${Build.VERSION.SDK_INT})")
+        if (!hasLowLatency) {
+            Log.w(TAG, "Device does not advertise low-latency audio support - sync accuracy may be reduced")
+        }
+
         val channelConfig = when (channels) {
             1 -> AudioFormat.CHANNEL_OUT_MONO
             2 -> AudioFormat.CHANNEL_OUT_STEREO
@@ -248,10 +260,21 @@ class SyncAudioPlayer(
             }
         }
 
-        // Calculate minimum buffer size
+        // Get device native audio properties for fast track audio path
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val framesPerBufferStr = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+        val framesPerBuffer = framesPerBufferStr?.toIntOrNull() ?: 256
+
+        // Calculate buffer sizes
         val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
-        // Use larger buffer for scheduling headroom
-        val bufferSize = maxOf(minBufferSize * 4, sampleRate * bytesPerFrame) // ~1 second
+
+        // Fast track buffer: native frames * 2 buffers (one playing, one filling)
+        val fastTrackBufferSize = framesPerBuffer * bytesPerFrame * 2
+
+        // Use fast track size but ensure it's at least minBufferSize
+        // Cap at 200ms for sync stability (we have BUFFER_HEADROOM_MS for scheduling)
+        val maxBufferSize = sampleRate * bytesPerFrame / 5  // 200ms
+        val bufferSize = maxOf(fastTrackBufferSize, minBufferSize).coerceAtMost(maxBufferSize)
 
         try {
             audioTrack = AudioTrack.Builder()
@@ -259,6 +282,7 @@ class SyncAudioPlayer(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setFlags(AudioAttributes.FLAG_LOW_LATENCY)  // Request fast track (API 21+)
                         .build()
                 )
                 .setAudioFormat(
@@ -282,7 +306,12 @@ class SyncAudioPlayer(
             // Pre-allocate lastOutputFrame buffer for sync correction (avoids GC in audio callback)
             lastOutputFrame = ByteArray(bytesPerFrame)
 
-            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit, buffer=${bufferSize}bytes")
+            // Log comprehensive configuration for debugging
+            val bufferMs = bufferSize.toFloat() / bytesPerFrame / sampleRate * 1000
+            val fastTrackMs = fastTrackBufferSize.toFloat() / bytesPerFrame / sampleRate * 1000
+            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit")
+            Log.i(TAG, "  Buffer: ${bufferSize}bytes (${bufferMs}ms), fastTrack=${framesPerBuffer} frames (${fastTrackMs}ms)")
+            Log.i(TAG, "  Flags: LOW_LATENCY=${true}, PERFORMANCE_MODE=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.O}")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioTrack", e)
         }
