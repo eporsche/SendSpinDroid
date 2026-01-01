@@ -91,9 +91,7 @@ class SyncAudioPlayer(
         private const val CORRECTION_TARGET_SECONDS = 2.0       // Fix error over 2 seconds
 
         // Buffer configuration
-        // Reduced from 200ms since we now compensate for AudioTrack latency
-        // This is the maximum "too early" threshold before we delay scheduling
-        private const val BUFFER_HEADROOM_MS = 100  // Schedule audio up to 100ms ahead
+        private const val BUFFER_HEADROOM_MS = 200  // Schedule audio 200ms ahead
 
         // Smoothing for sync error measurement
         private const val SYNC_ERROR_ALPHA = 0.1    // EMA smoothing factor
@@ -217,11 +215,6 @@ class SyncAudioPlayer(
     // Microseconds per sample frame
     private val microsPerSample = 1_000_000.0 / sampleRate
 
-    // AudioTrack buffer latency compensation (calculated during initialization)
-    // This represents the time audio spends in AudioTrack's internal buffer
-    // before reaching the DAC/speakers
-    private var audioTrackLatencyUs = 0L
-
     /**
      * Initialize the audio player with the specified format.
      */
@@ -289,12 +282,7 @@ class SyncAudioPlayer(
             // Pre-allocate lastOutputFrame buffer for sync correction (avoids GC in audio callback)
             lastOutputFrame = ByteArray(bytesPerFrame)
 
-            // Calculate AudioTrack buffer latency for scheduling compensation
-            // This is the time audio spends in the buffer before reaching the DAC
-            val bufferFrames = bufferSize / bytesPerFrame
-            audioTrackLatencyUs = (bufferFrames * 1_000_000L) / sampleRate
-
-            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit, buffer=${bufferSize}bytes, latency=${audioTrackLatencyUs/1000}ms")
+            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit, buffer=${bufferSize}bytes")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioTrack", e)
         }
@@ -765,10 +753,9 @@ class SyncAudioPlayer(
                     firstServerTimestampUs = firstPlayableChunk.serverTimeMicros
                 }
 
-                // CRITICAL: Update scheduledStartDacTimeUs to NOW + buffer latency
-                // Audio written now will reach DAC after AudioTrack buffer delay
+                // CRITICAL: Update scheduledStartDacTimeUs to NOW
                 val actualStartTime = System.nanoTime() / 1000
-                scheduledStartDacTimeUs = actualStartTime + audioTrackLatencyUs
+                scheduledStartDacTimeUs = actualStartTime
 
                 framesDropped += droppedFrames.toLong()
                 setPlaybackState(PlaybackState.PLAYING)
@@ -777,10 +764,10 @@ class SyncAudioPlayer(
             }
             else -> {
                 // Within tolerance - start playing
-                // CRITICAL: Update scheduledStartDacTimeUs to NOW + buffer latency
-                // Audio written now will reach DAC after AudioTrack buffer delay
+                // CRITICAL: Update scheduledStartDacTimeUs to NOW, not when first chunk arrived
+                // This is when playback actually begins, which is the reference for sync error calculation
                 val actualStartTime = System.nanoTime() / 1000
-                scheduledStartDacTimeUs = actualStartTime + audioTrackLatencyUs
+                scheduledStartDacTimeUs = actualStartTime
                 setPlaybackState(PlaybackState.PLAYING)
                 Log.i(TAG, "Start gating complete: delta=${deltaUs/1000}ms, actualStartTime=${actualStartTime/1000}ms, now PLAYING")
                 return false  // Ready to play
@@ -937,9 +924,7 @@ class SyncAudioPlayer(
                 val nowMicros = System.nanoTime() / 1000
 
                 // How far in the future should this chunk play?
-                // Compensate for AudioTrack buffer latency - audio written now
-                // will reach the DAC audioTrackLatencyUs microseconds later
-                val delayMicros = chunk.clientPlayTimeMicros - nowMicros - audioTrackLatencyUs
+                val delayMicros = chunk.clientPlayTimeMicros - nowMicros
 
                 when {
                     // Too early - wait
