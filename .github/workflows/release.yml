@@ -74,17 +74,27 @@ jobs:
           echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
         fi
 
-    - name: Find and rename APK
+    - name: Find and rename APK (release)
+      if: env.SIGNING_ENABLED == 'true'
       run: |
         cd android/app/build/outputs/apk/release
         APK_FILE=$(ls *.apk | head -1)
         mv "$APK_FILE" SendSpinDroid-${{ steps.get_version.outputs.VERSION }}.apk
+        echo "APK_PATH=android/app/build/outputs/apk/release/SendSpinDroid-${{ steps.get_version.outputs.VERSION }}.apk" >> $GITHUB_ENV
+
+    - name: Find and rename APK (debug)
+      if: env.SIGNING_ENABLED == 'false'
+      run: |
+        cd android/app/build/outputs/apk/debug
+        APK_FILE=$(ls *.apk | head -1)
+        mv "$APK_FILE" SendSpinDroid-${{ steps.get_version.outputs.VERSION }}-debug.apk
+        echo "APK_PATH=android/app/build/outputs/apk/debug/SendSpinDroid-${{ steps.get_version.outputs.VERSION }}-debug.apk" >> $GITHUB_ENV
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.get_version.outputs.VERSION }}
-        files: android/app/build/outputs/apk/release/SendSpinDroid-${{ steps.get_version.outputs.VERSION }}.apk
+        files: ${{ env.APK_PATH }}
         draft: false
         prerelease: false
         generate_release_notes: true
