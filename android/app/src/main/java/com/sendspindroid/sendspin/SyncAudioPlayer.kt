@@ -271,7 +271,7 @@ class SyncAudioPlayer(
                         .build()
                 )
                 .setBufferSizeInBytes(bufferSize)
-                .setSessionId(AudioManager.GENERATE_NEW_AUDIO_SESSION_ID)
+                .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .apply {
                     // setPerformanceMode requires API 26 (Android 8.0 Oreo)
