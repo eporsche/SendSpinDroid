@@ -259,6 +259,7 @@ class SyncAudioPlayer(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
                         .build()
                 )
                 .setAudioFormat(
