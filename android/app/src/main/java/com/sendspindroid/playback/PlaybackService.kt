@@ -546,7 +546,6 @@ class PlaybackService : MediaLibraryService() {
 
                 // Create and start the audio player
                 syncAudioPlayer = SyncAudioPlayer(
-                    context = this@PlaybackService,
                     timeFilter = timeFilter,
                     sampleRate = sampleRate,
                     channels = channels,

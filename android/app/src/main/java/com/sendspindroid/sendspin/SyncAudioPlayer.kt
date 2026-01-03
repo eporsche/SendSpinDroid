@@ -1,10 +1,7 @@
 package com.sendspindroid.sendspin
 
-import android.content.Context
-import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.os.Build
@@ -77,7 +74,6 @@ interface SyncAudioPlayerCallback {
  * ```
  */
 class SyncAudioPlayer(
-    private val context: Context,
     private val timeFilter: SendspinTimeFilter,
     private val sampleRate: Int = 48000,
     private val channels: Int = 2,
@@ -88,15 +84,14 @@ class SyncAudioPlayer(
 
         // Sync correction thresholds (microseconds)
         private const val DEADBAND_THRESHOLD_US = 2_000L        // 2ms - no correction needed
-        private const val AGGRESSIVE_CORRECTION_THRESHOLD_US = 200_000L  // 200ms - apply max correction rate
-        private const val HARD_RESYNC_THRESHOLD_US = 800_000L   // 800ms - hard resync (drop/skip chunks)
+        private const val HARD_RESYNC_THRESHOLD_US = 200_000L   // 200ms - hard resync (drop/skip chunks)
 
         // Sample insert/drop correction constants (from Python reference)
         private const val MAX_SPEED_CORRECTION = 0.04           // +/-4% max correction rate
         private const val CORRECTION_TARGET_SECONDS = 2.0       // Fix error over 2 seconds
 
         // Buffer configuration
-        private const val BUFFER_HEADROOM_MS = 400  // Schedule audio 400ms ahead
+        private const val BUFFER_HEADROOM_MS = 200  // Schedule audio 200ms ahead
 
         // Smoothing for sync error measurement
         private const val SYNC_ERROR_ALPHA = 0.1    // EMA smoothing factor
@@ -108,7 +103,7 @@ class SyncAudioPlayer(
         private const val DAC_SLOPE_MAX = 1.001  // Maximum allowed slope for interpolation
 
         // Start gating configuration (from Python reference)
-        private const val MIN_BUFFER_BEFORE_START_MS = 400  // Wait for 400ms buffer before scheduling
+        private const val MIN_BUFFER_BEFORE_START_MS = 200  // Wait for 200ms buffer before scheduling
         private const val REANCHOR_THRESHOLD_US = 500_000L  // 500ms error triggers reanchor
         private const val REANCHOR_COOLDOWN_US = 5_000_000L // 5 second cooldown between reanchors
     }
@@ -236,14 +231,6 @@ class SyncAudioPlayer(
             }
         }
 
-        // Check if device supports low-latency audio feature
-        val packageManager = context.packageManager
-        val hasLowLatency = packageManager.hasSystemFeature(PackageManager.FEATURE_AUDIO_LOW_LATENCY)
-        Log.i(TAG, "Device low-latency audio support: $hasLowLatency (API ${Build.VERSION.SDK_INT})")
-        if (!hasLowLatency) {
-            Log.w(TAG, "Device does not advertise low-latency audio support - sync accuracy may be reduced")
-        }
-
         val channelConfig = when (channels) {
             1 -> AudioFormat.CHANNEL_OUT_MONO
             2 -> AudioFormat.CHANNEL_OUT_STEREO
@@ -261,21 +248,10 @@ class SyncAudioPlayer(
             }
         }
 
-        // Get device native audio properties for fast track audio path
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val framesPerBufferStr = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
-        val framesPerBuffer = framesPerBufferStr?.toIntOrNull() ?: 256
-
-        // Calculate buffer sizes
+        // Calculate minimum buffer size
         val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
-
-        // Fast track buffer: native frames * 2 buffers (one playing, one filling)
-        val fastTrackBufferSize = framesPerBuffer * bytesPerFrame * 2
-
-        // Use fast track size but ensure it's at least minBufferSize
-        // Cap at 400ms for sync stability (we have BUFFER_HEADROOM_MS for scheduling)
-        val maxBufferSize = sampleRate * bytesPerFrame * 2 / 5  // 400ms
-        val bufferSize = maxOf(fastTrackBufferSize, minBufferSize).coerceAtMost(maxBufferSize)
+        // Use larger buffer for scheduling headroom
+        val bufferSize = maxOf(minBufferSize * 4, sampleRate * bytesPerFrame) // ~1 second
 
         try {
             audioTrack = AudioTrack.Builder()
@@ -283,7 +259,6 @@ class SyncAudioPlayer(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .setFlags(AudioAttributes.FLAG_LOW_LATENCY)  // Request fast track (API 21+)
                         .build()
                 )
                 .setAudioFormat(
@@ -307,12 +282,7 @@ class SyncAudioPlayer(
             // Pre-allocate lastOutputFrame buffer for sync correction (avoids GC in audio callback)
             lastOutputFrame = ByteArray(bytesPerFrame)
 
-            // Log comprehensive configuration for debugging
-            val bufferMs = bufferSize.toFloat() / bytesPerFrame / sampleRate * 1000
-            val fastTrackMs = fastTrackBufferSize.toFloat() / bytesPerFrame / sampleRate * 1000
-            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit")
-            Log.i(TAG, "  Buffer: ${bufferSize}bytes (${bufferMs}ms), fastTrack=${framesPerBuffer} frames (${fastTrackMs}ms)")
-            Log.i(TAG, "  Flags: LOW_LATENCY=${true}, PERFORMANCE_MODE=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.O}")
+            Log.i(TAG, "AudioTrack initialized: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit, buffer=${bufferSize}bytes")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioTrack", e)
         }
@@ -974,7 +944,7 @@ class SyncAudioPlayer(
 
                     // Hard resync needed - chunk is way too late
                     delayMicros < -HARD_RESYNC_THRESHOLD_US -> {
-                        // Chunk is more than 800ms late - drop it
+                        // Chunk is more than 200ms late - drop it
                         chunkQueue.poll()
                         totalQueuedSamples.addAndGet(-chunk.sampleCount.toLong())
                         chunksDropped++
@@ -985,7 +955,7 @@ class SyncAudioPlayer(
 
                     // Hard resync needed - chunk is way too early
                     delayMicros > HARD_RESYNC_THRESHOLD_US -> {
-                        // Chunk is more than 800ms early - wait more
+                        // Chunk is more than 200ms early - wait more
                         delay(50)
                         continue
                     }
@@ -1047,24 +1017,17 @@ class SyncAudioPlayer(
             return
         }
 
-        // Determine correction rate based on error magnitude
-        val correctionsPerSec = if (absErr >= AGGRESSIVE_CORRECTION_THRESHOLD_US) {
-            // Aggressive zone (200-800ms): apply maximum correction rate
-            // This prevents the drop loop by catching up quickly without dropping chunks
-            sampleRate * MAX_SPEED_CORRECTION
-        } else {
-            // Normal zone (2ms-200ms): proportional control
-            // Convert error from microseconds to frames
-            val framesError = absErr * sampleRate / 1_000_000.0
+        // Proportional control: correction rate proportional to error
+        // Convert error from microseconds to frames
+        val framesError = absErr * sampleRate / 1_000_000.0
 
-            // How many corrections per second do we want?
-            // We aim to fix the error over CORRECTION_TARGET_SECONDS
-            val desiredCorrectionsPerSec = framesError / CORRECTION_TARGET_SECONDS
+        // How many corrections per second do we want?
+        // We aim to fix the error over CORRECTION_TARGET_SECONDS
+        val desiredCorrectionsPerSec = framesError / CORRECTION_TARGET_SECONDS
 
-            // Cap at maximum correction rate (4% of sample rate)
-            val maxCorrectionsPerSec = sampleRate * MAX_SPEED_CORRECTION
-            minOf(desiredCorrectionsPerSec, maxCorrectionsPerSec)
-        }
+        // Cap at maximum correction rate (4% of sample rate)
+        val maxCorrectionsPerSec = sampleRate * MAX_SPEED_CORRECTION
+        val correctionsPerSec = minOf(desiredCorrectionsPerSec, maxCorrectionsPerSec)
 
         // Calculate interval between corrections
         val intervalFrames = if (correctionsPerSec > 0) {
