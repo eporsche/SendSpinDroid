@@ -2,6 +2,7 @@ package com.sendspindroid.sendspin
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.os.Build
@@ -270,6 +271,7 @@ class SyncAudioPlayer(
                         .build()
                 )
                 .setBufferSizeInBytes(bufferSize)
+                .setSessionId(AudioManager.GENERATE_NEW_AUDIO_SESSION_ID)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .apply {
                     // setPerformanceMode requires API 26 (Android 8.0 Oreo)
