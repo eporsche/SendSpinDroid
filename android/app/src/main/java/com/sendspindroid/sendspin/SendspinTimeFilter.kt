@@ -53,6 +53,12 @@ class SendspinTimeFilter {
         // Applied every update: drift *= (1 - DRIFT_DECAY_RATE)
         // At 1Hz updates, 0.01 gives ~1% decay per second, ~50% after 70 seconds
         private const val DRIFT_DECAY_RATE = 0.01
+
+        // Continuous forgetting factor - covariance grows by λ² each measurement
+        // This prevents overconfidence and allows smoother adaptation to gradual changes
+        // λ = 1.001 means ~0.2% growth per measurement
+        // At 4 measurements/sec, covariance doubles in ~3 minutes
+        private const val FORGETTING_FACTOR = 1.001
     }
 
     // State vector: [offset, drift]
@@ -76,6 +82,20 @@ class SendspinTimeFilter {
     // Static delay offset for speaker synchronization (GroupSync calibration)
     // Positive = delay playback (plays later), Negative = advance (plays earlier)
     private var staticDelayMicros: Long = 0
+
+    // Frozen state for reconnection - preserves sync across network drops
+    private var frozenState: FrozenState? = null
+
+    private data class FrozenState(
+        val offset: Double,
+        val drift: Double,
+        val p00: Double,
+        val p01: Double,
+        val p10: Double,
+        val p11: Double,
+        val measurementCount: Int,
+        val baselineClientTime: Long
+    )
 
     /**
      * Whether enough measurements have been collected for reliable time conversion.
@@ -113,6 +133,19 @@ class SendspinTimeFilter {
         get() = measurementCount
 
     /**
+     * Current drift in parts per million (ppm).
+     * Positive = server clock running faster than client.
+     */
+    val driftPpm: Double
+        get() = drift * 1_000_000.0
+
+    /**
+     * Time of last measurement update in microseconds (client time).
+     */
+    val lastUpdateTimeUs: Long
+        get() = lastUpdateTime
+
+    /**
      * Static delay in milliseconds for speaker synchronization.
      * Positive = delay playback (plays later), Negative = advance (plays earlier).
      * Used by GroupSync calibration tool.
@@ -136,6 +169,68 @@ class SendspinTimeFilter {
         lastUpdateTime = 0
         measurementCount = 0
         baselineClientTime = 0
+    }
+
+    /**
+     * Whether the filter has frozen state that can be restored.
+     */
+    val isFrozen: Boolean
+        get() = frozenState != null
+
+    /**
+     * Freeze the current filter state for reconnection.
+     * Preserves the converged time sync across network drops so playback
+     * can continue from buffer without losing synchronization.
+     *
+     * Call this when connection is lost but reconnection will be attempted.
+     */
+    fun freeze() {
+        if (!isReady) return  // Nothing worth preserving
+
+        frozenState = FrozenState(
+            offset = offset,
+            drift = drift,
+            p00 = p00,
+            p01 = p01,
+            p10 = p10,
+            p11 = p11,
+            measurementCount = measurementCount,
+            baselineClientTime = baselineClientTime
+        )
+    }
+
+    /**
+     * Restore frozen state after reconnection.
+     * Increases covariance to allow faster adaptation to potentially
+     * changed network conditions while preserving the general sync estimate.
+     *
+     * Call this after successful reconnection, before resuming time sync.
+     */
+    fun thaw() {
+        val frozen = frozenState ?: return
+
+        offset = frozen.offset
+        drift = frozen.drift
+        // Increase covariance by 10x to allow faster adaptation
+        // while preserving the general sync estimate
+        p00 = frozen.p00 * 10.0
+        p01 = frozen.p01 * 3.0
+        p10 = frozen.p10 * 3.0
+        p11 = frozen.p11 * 10.0
+        measurementCount = frozen.measurementCount
+        baselineClientTime = frozen.baselineClientTime
+        // Don't reset lastUpdateTime - will be updated on next measurement
+
+        frozenState = null
+    }
+
+    /**
+     * Discard frozen state and perform full reset.
+     * Call this when reconnection fails and we need to start fresh.
+     */
+    fun resetAndDiscard() {
+        frozenState = null
+        reset()
     }
 
     /**
@@ -192,10 +287,18 @@ class SendspinTimeFilter {
         // Covariance prediction: P = F * P * F^T + Q
         // F = [1, dt; 0, 1] (state transition matrix)
         // Q = [q_offset * dt, 0; 0, q_drift * dt] (process noise)
-        val p00New = p00 + 2 * p01 * dt + p11 * dt * dt + PROCESS_NOISE_OFFSET * dt
-        val p01New = p01 + p11 * dt
-        val p10New = p10 + p11 * dt
-        val p11New = p11 + PROCESS_NOISE_DRIFT * dt
+        var p00New = p00 + 2 * p01 * dt + p11 * dt * dt + PROCESS_NOISE_OFFSET * dt
+        var p01New = p01 + p11 * dt
+        var p10New = p10 + p11 * dt
+        var p11New = p11 + PROCESS_NOISE_DRIFT * dt
+
+        // Apply continuous forgetting factor (prevents overconfidence)
+        // This allows smoother adaptation to gradual changes in network conditions
+        val lambdaSquared = FORGETTING_FACTOR * FORGETTING_FACTOR
+        p00New *= lambdaSquared
+        p01New *= lambdaSquared
+        p10New *= lambdaSquared
+        p11New *= lambdaSquared
 
         // === Innovation (Residual) ===
         val innovation = measurement - offsetPredicted
@@ -265,26 +368,20 @@ class SendspinTimeFilter {
      * Convert server time to client time.
      * Includes static delay offset for speaker synchronization.
      *
-     * Uses relative time calculation to prevent drift accumulation over long periods.
-     * The baseline time (set on first measurement) is used as reference point.
+     * NOTE: Drift is intentionally NOT used in time conversion (matching Python reference).
+     * The sync correction feedback loop handles clock rate differences naturally through
+     * sample insert/drop. Using drift here caused sync error oscillation because noisy
+     * drift estimates fed back into the sync error calculation, creating instability.
+     *
+     * Drift is still tracked and displayed in Stats for Nerds for debugging purposes.
      *
      * @param serverTimeMicros Server timestamp in microseconds
      * @return Equivalent client timestamp in microseconds
      */
     fun serverToClient(serverTimeMicros: Long): Long {
-        // Use relative time from baseline to prevent drift accumulation
-        // The drift term now operates on bounded time deltas instead of absolute time
-        //
-        // Original formula: T_client = (T_server - offset + drift * T_last) / (1 + drift)
-        // Rewritten as relative: T_client = T_server - offset + drift * (T_last - baseline)
-        //
-        // This bounds the drift correction term to the time since baseline, not time since epoch
-        val timeSinceBaseline = (lastUpdateTime - baselineClientTime).toDouble()
-        val driftCorrection = drift * timeSinceBaseline
-
-        // Simplified calculation: T_client ≈ T_server - offset + drift_correction
-        // The (1 + drift) divisor is essentially 1.0 for realistic drift values (±500 ppm)
-        val baseResult = serverTimeMicros - offset.toLong() + driftCorrection.toLong()
+        // Simple offset-only conversion (matches Python sendspin-cli)
+        // Drift is NOT applied here - the sync correction loop handles rate differences
+        val baseResult = serverTimeMicros - offset.toLong()
 
         // Apply static delay: positive delay = play later = higher client time
         return baseResult + staticDelayMicros
@@ -293,15 +390,13 @@ class SendspinTimeFilter {
     /**
      * Convert client time to server time.
      *
-     * Uses relative time calculation consistent with serverToClient.
+     * NOTE: Drift is intentionally NOT used (see serverToClient comments).
      *
      * @param clientTimeMicros Client timestamp in microseconds
      * @return Equivalent server timestamp in microseconds
      */
     fun clientToServer(clientTimeMicros: Long): Long {
-        // Inverse of serverToClient, using relative time from baseline
-        val timeSinceBaseline = (lastUpdateTime - baselineClientTime).toDouble()
-        val driftCorrection = drift * timeSinceBaseline
-        return clientTimeMicros + offset.toLong() - driftCorrection.toLong()
+        // Simple offset-only conversion (matches Python sendspin-cli)
+        return clientTimeMicros + offset.toLong() - staticDelayMicros
     }
 }

@@ -8,7 +8,9 @@
     <string name="pause">Pause</string>
     <string name="previous">Previous</string>
     <string name="next">Next</string>
+    <string name="switch_group">Switch Group</string>
     <string name="volume">Volume</string>
+    <string name="group_label">Group: %s</string>
     <string name="not_connected">Not Connected</string>
     <string name="discovering">Discovering servers...</string>
     <string name="no_servers_found">No servers found</string>
@@ -28,6 +30,7 @@
     <string name="accessibility_pause_button">Pause button</string>
     <string name="accessibility_previous_button">Previous track button</string>
     <string name="accessibility_next_button">Next track button</string>
+    <string name="accessibility_switch_group_button">Switch to next playback group</string>
     <string name="accessibility_volume_slider">Volume slider</string>
     <string name="accessibility_volume_percent">Volume %1$d percent</string>
     <string name="accessibility_progress_slider">Track progress slider</string>
@@ -98,6 +101,9 @@
     <string name="stats_section_sync_correction">SYNC CORRECTION</string>
     <string name="stats_section_clock_sync">CLOCK SYNC</string>
 
+    <!-- Stats labels - Connection -->
+    <string name="stats_audio_codec">Codec</string>
+
     <!-- Stats labels - Sync Status -->
     <string name="stats_playback_state">Playback State</string>
     <string name="stats_sync_error">Sync Error</string>
@@ -135,7 +141,33 @@
     <string name="pref_category_audio">Audio Sync</string>
     <string name="pref_sync_offset_title">Manual Sync Offset</string>
     <string name="pref_sync_offset_summary">Adjust timing: positive delays playback, negative advances it</string>
-    <string name="pref_sync_offset_value">%+d ms</string>
+    <string name="pref_sync_offset_dialog_title">Sync Offset (ms)</string>
+    <string name="pref_sync_offset_value">Current: %+d ms</string>
+    <string name="pref_sync_offset_invalid">Please enter a valid number</string>
+    <string name="pref_sync_offset_clamped">Value clamped to range %1$d to %2$d ms</string>
+    <string name="sync_offset_decrease">Decrease sync offset by 10ms</string>
+    <string name="sync_offset_increase">Increase sync offset by 10ms</string>
+    <string name="pref_codec_title">Preferred Audio Codec</string>
+    <string name="pref_codec_summary">Server will try to send audio in this format first</string>
+    <string-array name="codec_entries">
+        <item>PCM (Uncompressed)</item>
+        <item>FLAC (Lossless)</item>
+        <item>OPUS (Compressed)</item>
+    </string-array>
+    <string-array name="codec_values">
+        <item>pcm</item>
+        <item>flac</item>
+        <item>opus</item>
+    </string-array>
+    <string name="pref_codec_reconnect_title">Reconnect Required</string>
+    <string name="pref_codec_reconnect_message">The new codec preference will be used the next time you connect to a server.</string>
+
+    <!-- Network-specific codec preferences -->
+    <string name="pref_category_network_codecs">Network Codec Preferences</string>
+    <string name="pref_codec_wifi_title">Codec on WiFi</string>
+    <string name="pref_codec_wifi_summary">Audio codec when connected via WiFi (leave unset to use default)</string>
+    <string name="pref_codec_cellular_title">Codec on Cellular</string>
+    <string name="pref_codec_cellular_summary">Audio codec when connected via cellular data (leave unset to use default)</string>
 
     <!-- Disconnect dialog -->
     <string name="disconnect_dialog_title">Disconnect from server?</string>
@@ -146,6 +178,15 @@
     <!-- Permission strings -->
     <string name="permission_bind_playback_service_label">Bind to SendSpin Playback Service</string>
     <string name="permission_bind_playback_service_description">Allows the app to bind to the SendSpin playback service for audio control. Only apps signed with the same certificate can use this permission.</string>
+
+    <!-- Performance -->
+    <string name="pref_category_performance">Performance</string>
+    <string name="pref_low_memory_title">Low Memory Mode</string>
+    <string name="pref_low_memory_summary">Reduces memory by skipping album artwork and reducing audio buffer. Use when controlling from server.</string>
+    <string name="pref_low_memory_restart_title">Restart Required</string>
+    <string name="pref_low_memory_restart_message">Low Memory Mode requires a restart to take full effect.</string>
+    <string name="pref_low_memory_restart_now">Restart Now</string>
+    <string name="pref_low_memory_restart_later">Later</string>
 
     <!-- Debug logging -->
     <string name="pref_category_debug">Debug</string>

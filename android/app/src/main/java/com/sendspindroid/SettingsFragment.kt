@@ -5,12 +5,17 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
+import android.util.Log
 import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
-import androidx.preference.SeekBarPreference
 import androidx.preference.SwitchPreferenceCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.sendspindroid.debug.DebugLogger
+import kotlin.system.exitProcess
+
+// Note: SyncOffsetPreference is a custom preference that handles its own UI
 
 /**
  * Fragment displaying user preferences.
@@ -19,10 +24,7 @@ import com.sendspindroid.debug.DebugLogger
 class SettingsFragment : PreferenceFragmentCompat() {
 
     companion object {
-        // SeekBar key (different from UserSettings key since we use 0-10000 range)
-        private const val KEY_SYNC_OFFSET_SEEKBAR = "sync_offset_ms_seekbar"
-        // Offset to convert seekbar value (0-10000) to actual ms (-5000 to +5000)
-        private const val SEEKBAR_OFFSET = 5000
+        private const val TAG = "SettingsFragment"
 
         // Debug logging keys
         private const val KEY_DEBUG_LOGGING = "debug_logging_enabled"
@@ -50,24 +52,7 @@ class SettingsFragment : PreferenceFragmentCompat() {
             }
         }
 
-        // Set up sync offset preference
-        findPreference<SeekBarPreference>(KEY_SYNC_OFFSET_SEEKBAR)?.apply {
-            // Initialize seekbar from saved offset
-            val savedOffset = UserSettings.getSyncOffsetMs()
-            value = savedOffset + SEEKBAR_OFFSET
-
-            // Update summary to show actual offset value
-            updateSyncOffsetSummary(this, savedOffset)
-
-            // Listen for changes
-            setOnPreferenceChangeListener { _, newValue ->
-                val seekbarValue = newValue as Int
-                val actualOffset = seekbarValue - SEEKBAR_OFFSET
-                UserSettings.setSyncOffsetMs(actualOffset)
-                updateSyncOffsetSummary(this, actualOffset)
-                true
-            }
-        }
+        // Sync offset preference is handled by SyncOffsetPreference custom class
 
         // Set up debug logging toggle
         findPreference<SwitchPreferenceCompat>(KEY_DEBUG_LOGGING)?.apply {
@@ -99,6 +84,43 @@ class SettingsFragment : PreferenceFragmentCompat() {
                 true
             }
         }
+
+        // Set up low memory mode toggle with restart dialog
+        findPreference<SwitchPreferenceCompat>(UserSettings.KEY_LOW_MEMORY_MODE)?.apply {
+            setOnPreferenceChangeListener { _, _ ->
+                // Show restart dialog after preference is changed
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.pref_low_memory_restart_title)
+                    .setMessage(R.string.pref_low_memory_restart_message)
+                    .setPositiveButton(R.string.pref_low_memory_restart_now) { _, _ ->
+                        // Restart the app
+                        val intent = requireContext().packageManager
+                            .getLaunchIntentForPackage(requireContext().packageName)
+                        intent?.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        requireContext().startActivity(intent)
+                        exitProcess(0)
+                    }
+                    .setNegativeButton(R.string.pref_low_memory_restart_later, null)
+                    .show()
+                true  // Accept the preference change
+            }
+        }
+
+        // Set up preferred codec with reconnect dialog
+        findPreference<ListPreference>(UserSettings.KEY_PREFERRED_CODEC)?.apply {
+            setOnPreferenceChangeListener { _, newValue ->
+                val codec = newValue as String
+                Log.i(TAG, "Preferred codec changed to: $codec")
+
+                // Show reconnect dialog after preference is changed
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.pref_codec_reconnect_title)
+                    .setMessage(R.string.pref_codec_reconnect_message)
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+                true  // Accept the preference change
+            }
+        }
     }
 
     override fun onResume() {
@@ -127,10 +149,6 @@ class SettingsFragment : PreferenceFragmentCompat() {
     private fun stopDebugStatsUpdates() {
         updateRunnable?.let { handler.removeCallbacks(it) }
         updateRunnable = null
-    }
-
-    private fun updateSyncOffsetSummary(pref: SeekBarPreference, offsetMs: Int) {
-        pref.summary = getString(R.string.pref_sync_offset_value, offsetMs)
     }
 
     private fun updateDebugLoggingSummary(pref: SwitchPreferenceCompat?) {

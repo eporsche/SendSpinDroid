@@ -119,7 +119,9 @@ class SendSpinPlayer : Player {
             SyncPlaybackState.WAITING_FOR_START -> {
                 updatePlaybackStateInternal(Player.STATE_BUFFERING, playWhenReady)
             }
-            SyncPlaybackState.PLAYING -> {
+            SyncPlaybackState.PLAYING,
+            SyncPlaybackState.DRAINING -> {
+                // DRAINING is still actively playing from buffer, so STATE_READY
                 updatePlaybackStateInternal(Player.STATE_READY, true)
             }
             SyncPlaybackState.REANCHORING -> {
@@ -146,7 +148,9 @@ class SendSpinPlayer : Player {
                 SyncPlaybackState.WAITING_FOR_START -> {
                     updatePlaybackStateInternal(Player.STATE_BUFFERING, playWhenReady)
                 }
-                SyncPlaybackState.PLAYING -> {
+                SyncPlaybackState.PLAYING,
+                SyncPlaybackState.DRAINING -> {
+                    // DRAINING is still actively playing from buffer, so STATE_READY
                     updatePlaybackStateInternal(Player.STATE_READY, true)
                 }
                 SyncPlaybackState.REANCHORING -> {
@@ -290,6 +294,32 @@ class SendSpinPlayer : Player {
             sendSpinClient?.pause()
         }
         listeners.forEach { it.onPlayWhenReadyChanged(playWhenReady, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) }
+    }
+
+    /**
+     * Updates playWhenReady state from server without sending a command back.
+     * Called when server pushes playback state changes (e.g., via group/update).
+     *
+     * This prevents the feedback loop where:
+     * 1. Server sends PLAYING state
+     * 2. We set playWhenReady = true
+     * 3. We send play() command back to server (unnecessary)
+     *
+     * @param playing Whether the server says playback is active
+     */
+    fun updatePlayWhenReadyFromServer(playing: Boolean) {
+        if (this.playWhenReady != playing) {
+            android.util.Log.i(TAG, "updatePlayWhenReadyFromServer: $playing (was ${this.playWhenReady})")
+            this.playWhenReady = playing
+            listeners.forEach { it.onPlayWhenReadyChanged(playing, Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE) }
+
+            // Also update isPlaying state and notify listeners
+            val newIsPlaying = playing && currentPlaybackState == Player.STATE_READY
+            if (newIsPlaying != currentlyPlaying) {
+                currentlyPlaying = newIsPlaying
+                listeners.forEach { it.onIsPlayingChanged(newIsPlaying) }
+            }
+        }
     }
 
     override fun getPlaybackSuppressionReason(): Int = Player.PLAYBACK_SUPPRESSION_REASON_NONE

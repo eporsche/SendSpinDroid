@@ -118,10 +118,14 @@
 
         <!-- MainActivity: Primary activity and app entry point
              - exported: Allow external apps to launch (required for MAIN/LAUNCHER intent-filter)
+             - configChanges: Handle these changes without recreating activity
+               Prevents playback UI disruption on rotation/resize
              - Security: Only export activities that should be accessible externally -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
+            android:exported="true"
+            android:launchMode="singleTop">
 
             <!-- intent-filter: Defines how this activity can be started
                  This combination makes MainActivity the app's launcher icon -->
@@ -207,8 +211,13 @@
     <!--
         TODO for v2: Add feature declarations for Google Play filtering:
         <uses-feature android:name="android.hardware.wifi" android:required="true" />
-        <uses-feature android:name="android.hardware.audio.output" android:required="true" />
         <uses-feature android:name="android.software.leanback" android:required="false" /> (for Android TV)
     -->
+
+    <!-- AUDIO OUTPUT: Required for Android Auto app discovery
+         Permission level: Feature declaration (not a permission)
+         Required by: Android Auto to recognize this as a media app
+         Note: required="false" allows app to work on phones without speakers -->
+    <uses-feature android:name="android.hardware.audio.output" android:required="false" />
 
 </manifest>

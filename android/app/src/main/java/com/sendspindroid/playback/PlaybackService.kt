@@ -1,8 +1,12 @@
 package com.sendspindroid.playback
 
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
+import android.media.AudioManager
+import android.provider.Settings
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
@@ -33,6 +37,7 @@ import coil.request.SuccessResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.sendspindroid.MainActivity
 import com.sendspindroid.ServerRepository
 import com.sendspindroid.debug.DebugLogger
 import com.sendspindroid.model.PlaybackState
@@ -42,6 +47,10 @@ import com.sendspindroid.sendspin.SendSpinClient
 import com.sendspindroid.sendspin.SyncAudioPlayer
 import com.sendspindroid.sendspin.SyncAudioPlayerCallback
 import com.sendspindroid.sendspin.PlaybackState as SyncPlaybackState
+import com.sendspindroid.sendspin.decoder.AudioDecoder
+import com.sendspindroid.sendspin.decoder.AudioDecoderFactory
+import com.sendspindroid.network.NetworkEvaluator
+import com.sendspindroid.network.NetworkState
 import androidx.media3.session.DefaultMediaNotificationProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -87,6 +96,8 @@ class PlaybackService : MediaLibraryService() {
     private var forwardingPlayer: MetadataForwardingPlayer? = null
     private var sendSpinClient: SendSpinClient? = null
     private var syncAudioPlayer: SyncAudioPlayer? = null
+    private var audioDecoder: AudioDecoder? = null
+    private var currentCodec: String = "pcm"  // Track current stream codec for stats
 
     // Handler for posting callbacks to main thread
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -102,7 +113,8 @@ class PlaybackService : MediaLibraryService() {
     // Artwork state
     private var lastArtworkUrl: String? = null
     private var currentArtwork: Bitmap? = null
-    private lateinit var imageLoader: ImageLoader
+    // ImageLoader is null when low memory mode is enabled
+    private var imageLoader: ImageLoader? = null
 
     // Coroutine scope for background tasks (artwork loading)
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -141,12 +153,22 @@ class PlaybackService : MediaLibraryService() {
     // Network change detection - resets time filter when network changes
     private var connectivityManager: ConnectivityManager? = null
     private var lastNetworkId: Int = -1
+    private var networkEvaluator: NetworkEvaluator? = null
+
+    // AudioManager for device volume control (Spotify-style hybrid approach)
+    private var audioManager: AudioManager? = null
+    private var volumeObserver: ContentObserver? = null
+    private var lastKnownVolume: Int = -1  // Track to detect external volume changes
+
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val networkId = network.hashCode()
             Log.d(TAG, "Network available: id=$networkId (last=$lastNetworkId)")
 
-            // Only trigger if we had a previous network and it changed
+            // Evaluate network conditions
+            networkEvaluator?.evaluateCurrentNetwork(network)
+
+            // Only trigger time filter reset if we had a previous network and it changed
             if (lastNetworkId != -1 && lastNetworkId != networkId) {
                 Log.i(TAG, "Network changed from $lastNetworkId to $networkId")
                 sendSpinClient?.onNetworkChanged()
@@ -157,11 +179,14 @@ class PlaybackService : MediaLibraryService() {
         override fun onLost(network: Network) {
             Log.d(TAG, "Network lost: id=${network.hashCode()}")
             // Don't reset lastNetworkId here - we want to detect when a new network comes up
+            // Update network evaluator to reflect disconnected state
+            networkEvaluator?.evaluateCurrentNetwork(null)
         }
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            // Could also detect WiFi SSID changes here if needed
+            // Re-evaluate network conditions when capabilities change (e.g., signal strength)
             Log.d(TAG, "Network capabilities changed: id=${network.hashCode()}")
+            networkEvaluator?.evaluateCurrentNetwork(network)
         }
     }
 
@@ -184,6 +209,7 @@ class PlaybackService : MediaLibraryService() {
         const val COMMAND_SET_VOLUME = "com.sendspindroid.SET_VOLUME"
         const val COMMAND_NEXT = "com.sendspindroid.NEXT"
         const val COMMAND_PREVIOUS = "com.sendspindroid.PREVIOUS"
+        const val COMMAND_SWITCH_GROUP = "com.sendspindroid.SWITCH_GROUP"
         const val COMMAND_GET_STATS = "com.sendspindroid.GET_STATS"
 
         // Command arguments
@@ -208,10 +234,14 @@ class PlaybackService : MediaLibraryService() {
         // Session extras keys for volume (server → controller)
         const val EXTRA_VOLUME = "volume"
 
+        // Session extras keys for group info
+        const val EXTRA_GROUP_NAME = "group_name"
+
         // Connection state values
         const val STATE_DISCONNECTED = "disconnected"
         const val STATE_CONNECTING = "connecting"
         const val STATE_CONNECTED = "connected"
+        const val STATE_RECONNECTING = "reconnecting"
         const val STATE_ERROR = "error"
 
         // Android Auto browse tree media IDs
@@ -229,6 +259,8 @@ class PlaybackService : MediaLibraryService() {
         object Disconnected : ConnectionState()
         object Connecting : ConnectionState()
         data class Connected(val serverName: String) : ConnectionState()
+        /** Connection lost, reconnecting - playback continues from buffer */
+        data class Reconnecting(val serverName: String, val attempt: Int) : ConnectionState()
         data class Error(val message: String) : ConnectionState()
     }
 
@@ -247,13 +279,17 @@ class PlaybackService : MediaLibraryService() {
                 .build()
         )
 
-        // Initialize Coil ImageLoader for artwork fetching
-        imageLoader = ImageLoader.Builder(this)
-            .crossfade(true)
-            .build()
-
-        // Initialize UserSettings for player name preference
+        // Initialize UserSettings for player name preference (must be before lowMemoryMode check)
         com.sendspindroid.UserSettings.initialize(this)
+
+        // Initialize Coil ImageLoader for artwork fetching (skip in low memory mode)
+        if (!com.sendspindroid.UserSettings.lowMemoryMode) {
+            imageLoader = ImageLoader.Builder(this)
+                .crossfade(true)
+                .build()
+        } else {
+            Log.i(TAG, "Low Memory Mode: Skipping ImageLoader initialization")
+        }
 
         // Initialize SendSpinPlayer
         initializePlayer()
@@ -264,8 +300,68 @@ class PlaybackService : MediaLibraryService() {
         // Initialize native Kotlin SendSpin client
         initializeSendSpinClient()
 
+        // Initialize network evaluator for passive network monitoring
+        networkEvaluator = NetworkEvaluator(this)
+
         // Register network callback to detect network changes
         registerNetworkCallback()
+
+        // Perform initial network evaluation
+        networkEvaluator?.evaluateCurrentNetwork()
+
+        // Initialize AudioManager for device volume control
+        initializeVolumeControl()
+    }
+
+    /**
+     * Initializes device volume control (Spotify-style hybrid approach).
+     *
+     * This sets up:
+     * - AudioManager for reading/writing device STREAM_MUSIC volume
+     * - ContentObserver to detect hardware volume button presses and sync to server
+     *
+     * Hardware volume buttons now control playback volume, and changes are
+     * synced to the SendSpin server for multi-client coordination.
+     */
+    private fun initializeVolumeControl() {
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        // Track current volume to detect external changes
+        lastKnownVolume = audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: 0
+
+        // Create observer to detect volume changes from hardware buttons
+        volumeObserver = object : ContentObserver(mainHandler) {
+            override fun onChange(selfChange: Boolean) {
+                val currentVolume = audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: return
+
+                // Only sync to server if volume actually changed (not our own change)
+                if (currentVolume != lastKnownVolume) {
+                    lastKnownVolume = currentVolume
+
+                    // Convert to normalized 0.0-1.0 and sync to server
+                    val maxVolume = audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
+                    val normalizedVolume = currentVolume.toFloat() / maxVolume
+                    Log.d(TAG, "Device volume changed via hardware buttons: $currentVolume/$maxVolume ($normalizedVolume)")
+
+                    // Sync to server (for multi-client coordination)
+                    sendSpinClient?.setVolume(normalizedVolume.toDouble())
+
+                    // Update playback state for UI sync
+                    val volumePercent = (normalizedVolume * 100).toInt()
+                    _playbackState.value = _playbackState.value.copy(volume = volumePercent)
+                    broadcastSessionExtras()
+                }
+            }
+        }
+
+        // Register the volume observer
+        contentResolver.registerContentObserver(
+            Settings.System.CONTENT_URI,
+            true,
+            volumeObserver!!
+        )
+
+        Log.d(TAG, "Volume control initialized - using device STREAM_MUSIC")
     }
 
     /**
@@ -329,6 +425,34 @@ class PlaybackService : MediaLibraryService() {
                 Log.d(TAG, "SyncAudioPlayer state changed: $state")
                 // Update SendSpinPlayer so it notifies MediaSession listeners
                 sendSpinPlayer?.updateStateFromPlayer()
+            }
+        }
+
+        override fun onBufferLow(remainingMs: Long) {
+            Log.w(TAG, "Buffer low during reconnection: ${remainingMs}ms remaining")
+            // Update session extras so UI can show buffer status
+            mainHandler.post {
+                broadcastSessionExtras()
+            }
+        }
+
+        @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+        override fun onBufferExhausted() {
+            Log.e(TAG, "Buffer exhausted during reconnection - stopping playback")
+            mainHandler.post {
+                // Stop audio playback
+                syncAudioPlayer?.stop()
+                releaseWakeLock()
+
+                // Update connection state to error
+                _connectionState.value = ConnectionState.Error("Connection lost. Buffer exhausted.")
+                broadcastConnectionState(STATE_ERROR, errorMessage = "Connection lost")
+
+                // Clear playback state
+                _playbackState.value = _playbackState.value.copy(
+                    playbackState = PlaybackStateType.STOPPED
+                )
+                sendSpinPlayer?.updatePlayWhenReadyFromServer(false)
             }
         }
     }
@@ -408,6 +532,9 @@ class PlaybackService : MediaLibraryService() {
                 Log.d(TAG, "State changed: $state")
                 val newState = PlaybackStateType.fromString(state)
 
+                // Update playWhenReady from server state (without sending command back)
+                sendSpinPlayer?.updatePlayWhenReadyFromServer(newState == PlaybackStateType.PLAYING)
+
                 // Stop audio immediately when server stops/pauses playback
                 if (newState == PlaybackStateType.STOPPED || newState == PlaybackStateType.PAUSED) {
                     Log.d(TAG, "State is stopped/paused - clearing audio buffer")
@@ -427,6 +554,11 @@ class PlaybackService : MediaLibraryService() {
                 val currentState = _playbackState.value
                 val isGroupChange = groupId.isNotEmpty() && groupId != currentState.groupId
                 val newPlaybackState = PlaybackStateType.fromString(playbackState)
+
+                // Update playWhenReady from server state (without sending command back)
+                if (playbackState.isNotEmpty()) {
+                    sendSpinPlayer?.updatePlayWhenReadyFromServer(newPlaybackState == PlaybackStateType.PLAYING)
+                }
 
                 // Handle playback state changes for audio player and notifications
                 if (playbackState.isNotEmpty()) {
@@ -461,6 +593,9 @@ class PlaybackService : MediaLibraryService() {
                     )
                 }
                 _playbackState.value = newState
+
+                // Broadcast all state including group name to controllers (MainActivity)
+                broadcastSessionExtras()
             }
         }
 
@@ -503,6 +638,11 @@ class PlaybackService : MediaLibraryService() {
         }
 
         override fun onArtwork(imageData: ByteArray) {
+            // Skip artwork processing in low memory mode
+            if (com.sendspindroid.UserSettings.lowMemoryMode) {
+                return
+            }
+
             mainHandler.post {
                 Log.d(TAG, "Artwork received: ${imageData.size} bytes")
                 try {
@@ -527,12 +667,24 @@ class PlaybackService : MediaLibraryService() {
             }
         }
 
-        override fun onStreamStart(codec: String, sampleRate: Int, channels: Int, bitDepth: Int) {
+        override fun onStreamStart(codec: String, sampleRate: Int, channels: Int, bitDepth: Int, codecHeader: ByteArray?) {
             mainHandler.post {
-                Log.d(TAG, "Stream started: codec=$codec, rate=$sampleRate, channels=$channels, bits=$bitDepth")
+                Log.d(TAG, "Stream started: codec=$codec, rate=$sampleRate, channels=$channels, bits=$bitDepth, header=${codecHeader?.size ?: 0} bytes")
+                currentCodec = codec
 
                 // Stop existing player if any
                 syncAudioPlayer?.release()
+
+                // Release existing decoder and create new one for this stream
+                audioDecoder?.release()
+                try {
+                    audioDecoder = AudioDecoderFactory.create(codec)
+                    audioDecoder?.configure(sampleRate, channels, bitDepth, codecHeader)
+                    Log.i(TAG, "Audio decoder created: $codec")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to create decoder for $codec, falling back to PCM", e)
+                    audioDecoder = AudioDecoderFactory.create("pcm")
+                }
 
                 // Get the time filter from SendSpinClient
                 val timeFilter = sendSpinClient?.getTimeFilter()
@@ -564,26 +716,33 @@ class PlaybackService : MediaLibraryService() {
 
         override fun onStreamClear() {
             mainHandler.post {
-                Log.d(TAG, "Stream clear - flushing audio buffers")
+                Log.d(TAG, "Stream clear - flushing audio and decoder buffers")
+                audioDecoder?.flush()
                 syncAudioPlayer?.clearBuffer()
             }
         }
 
-        override fun onAudioChunk(serverTimeMicros: Long, pcmData: ByteArray) {
-            // Queue chunk directly - SyncAudioPlayer handles threading internally
+        override fun onAudioChunk(serverTimeMicros: Long, audioData: ByteArray) {
+            // Decode compressed data to PCM (pass-through for PCM codec)
+            val pcmData = try {
+                audioDecoder?.decode(audioData) ?: audioData
+            } catch (e: Exception) {
+                Log.e(TAG, "Decode error, dropping chunk", e)
+                return
+            }
+            // Queue decoded PCM - SyncAudioPlayer handles threading internally
             syncAudioPlayer?.queueChunk(serverTimeMicros, pcmData)
         }
 
         override fun onVolumeChanged(volume: Int) {
             mainHandler.post {
-                // Convert from 0-100 to 0.0-1.0 and apply to local audio player
+                // Convert from 0-100 to 0.0-1.0 and apply to device volume
                 val volumeFloat = volume / 100f
-                syncAudioPlayer?.setVolume(volumeFloat)
-                // Broadcast volume to UI controllers
-                val extras = Bundle().apply {
-                    putInt(EXTRA_VOLUME, volume)
-                }
-                mediaSession?.setSessionExtras(extras)
+                setVolume(volumeFloat)  // Sets device STREAM_MUSIC volume
+                // Update playback state with new volume
+                _playbackState.value = _playbackState.value.copy(volume = volume)
+                // Broadcast all state including volume to UI controllers
+                broadcastSessionExtras()
             }
         }
 
@@ -606,12 +765,44 @@ class PlaybackService : MediaLibraryService() {
                 syncAudioPlayer?.clearBuffer()
             }
         }
+
+        override fun onReconnecting(attempt: Int, serverName: String) {
+            android.util.Log.i(TAG, "Reconnecting to $serverName (attempt $attempt) - entering DRAINING mode")
+            mainHandler.post {
+                // Enter draining mode - continue playing from buffer
+                syncAudioPlayer?.enterDraining()
+
+                // Update connection state for UI (shows "Reconnecting..." indicator)
+                _connectionState.value = ConnectionState.Reconnecting(serverName, attempt)
+
+                // Broadcast to UI
+                broadcastConnectionState(STATE_RECONNECTING, serverName)
+            }
+        }
+
+        override fun onReconnected() {
+            android.util.Log.i(TAG, "Reconnected successfully - exiting DRAINING mode")
+            mainHandler.post {
+                // Exit draining mode - new stream will arrive shortly
+                syncAudioPlayer?.exitDraining()
+
+                // Connection state will be updated by onConnected() callback which follows
+            }
+        }
     }
 
     /**
      * Fetches artwork from a URL using Coil.
+     * Skipped in low memory mode.
      */
     private fun fetchArtwork(url: String) {
+        // Skip artwork loading in low memory mode
+        if (com.sendspindroid.UserSettings.lowMemoryMode) {
+            return
+        }
+
+        val loader = imageLoader ?: return
+
         if (!isValidArtworkUrl(url)) {
             return
         }
@@ -622,7 +813,7 @@ class PlaybackService : MediaLibraryService() {
                     .data(url)
                     .build()
 
-                val result = imageLoader.execute(request)
+                val result = loader.execute(request)
                 if (result is SuccessResult) {
                     val bitmap = result.drawable.toBitmap()
                     mainHandler.post {
@@ -692,14 +883,62 @@ class PlaybackService : MediaLibraryService() {
         durationMs: Long,
         positionMs: Long
     ) {
+        // Use unified broadcast to avoid overwriting other extras
+        broadcastSessionExtras()
+    }
+
+    /**
+     * Broadcasts all session state to MediaControllers via session extras.
+     *
+     * This unified method ensures all state (connection, metadata, group, volume)
+     * is broadcast together, preventing individual setSessionExtras calls from
+     * overwriting each other.
+     *
+     * Call this method whenever any state changes that needs to be reflected in the UI.
+     */
+    private fun broadcastSessionExtras() {
+        val playbackState = _playbackState.value
+        val connState = _connectionState.value
+
         val extras = Bundle().apply {
-            putString(EXTRA_TITLE, title)
-            putString(EXTRA_ARTIST, artist)
-            putString(EXTRA_ALBUM, album)
-            putString(EXTRA_ARTWORK_URL, artworkUrl ?: "")
-            putLong(EXTRA_DURATION_MS, durationMs)
-            putLong(EXTRA_POSITION_MS, positionMs)
+            // Connection state
+            when (connState) {
+                is ConnectionState.Disconnected -> putString(EXTRA_CONNECTION_STATE, STATE_DISCONNECTED)
+                is ConnectionState.Connecting -> putString(EXTRA_CONNECTION_STATE, STATE_CONNECTING)
+                is ConnectionState.Connected -> {
+                    putString(EXTRA_CONNECTION_STATE, STATE_CONNECTED)
+                    putString(EXTRA_SERVER_NAME, connState.serverName)
+                }
+                is ConnectionState.Reconnecting -> {
+                    putString(EXTRA_CONNECTION_STATE, STATE_RECONNECTING)
+                    putString(EXTRA_SERVER_NAME, connState.serverName)
+                    putInt("reconnect_attempt", connState.attempt)
+                    // Include buffer info if available
+                    syncAudioPlayer?.getBufferedDurationMs()?.let {
+                        putLong("buffer_remaining_ms", it)
+                    }
+                }
+                is ConnectionState.Error -> {
+                    putString(EXTRA_CONNECTION_STATE, STATE_ERROR)
+                    putString(EXTRA_ERROR_MESSAGE, connState.message)
+                }
+            }
+
+            // Metadata
+            putString(EXTRA_TITLE, playbackState.title ?: "")
+            putString(EXTRA_ARTIST, playbackState.artist ?: "")
+            putString(EXTRA_ALBUM, playbackState.album ?: "")
+            putString(EXTRA_ARTWORK_URL, playbackState.artworkUrl ?: "")
+            putLong(EXTRA_DURATION_MS, playbackState.durationMs)
+            putLong(EXTRA_POSITION_MS, playbackState.positionMs)
+
+            // Group info
+            playbackState.groupName?.let { putString(EXTRA_GROUP_NAME, it) }
+
+            // Volume
+            putInt(EXTRA_VOLUME, playbackState.volume)
         }
+
         mediaSession?.setSessionExtras(extras)
     }
 
@@ -720,6 +959,16 @@ class PlaybackService : MediaLibraryService() {
             if (sendSpinClient?.isConnected == true) {
                 Log.d(TAG, "Already connected, disconnecting first...")
                 sendSpinClient?.disconnect()
+            }
+
+            // Read current device volume and set as initial volume for server
+            val am = audioManager
+            if (am != null) {
+                val currentDeviceVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                val maxVolume = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                val volumePercent = ((currentDeviceVolume.toFloat() / maxVolume) * 100).toInt()
+                Log.d(TAG, "Setting initial volume from device: $currentDeviceVolume/$maxVolume = $volumePercent%")
+                sendSpinClient?.setInitialVolume(volumePercent)
             }
 
             sendSpinClient?.connect(address, path)
@@ -745,12 +994,8 @@ class PlaybackService : MediaLibraryService() {
         serverName: String? = null,
         errorMessage: String? = null
     ) {
-        val extras = Bundle().apply {
-            putString(EXTRA_CONNECTION_STATE, state)
-            serverName?.let { putString(EXTRA_SERVER_NAME, it) }
-            errorMessage?.let { putString(EXTRA_ERROR_MESSAGE, it) }
-        }
-        mediaSession?.setSessionExtras(extras)
+        // Use unified broadcast to avoid overwriting other extras
+        broadcastSessionExtras()
     }
 
     /**
@@ -762,12 +1007,26 @@ class PlaybackService : MediaLibraryService() {
     }
 
     /**
-     * Sets the playback volume.
-     * Volume is controlled locally on the audio player, not sent to the server.
+     * Sets the playback volume via device STREAM_MUSIC (Spotify-style).
+     *
+     * Volume is controlled via the device's media stream, not per-app gain.
+     * This enables hardware volume button support and follows best practices
+     * used by Spotify, Plexamp, and other major media apps.
+     *
+     * @param volume Normalized volume from 0.0 (mute) to 1.0 (full)
      */
     fun setVolume(volume: Float) {
-        Log.d(TAG, "Setting volume: $volume")
-        syncAudioPlayer?.setVolume(volume)
+        val am = audioManager ?: return
+        val maxVolume = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val newVolume = (volume * maxVolume).toInt().coerceIn(0, maxVolume)
+
+        Log.d(TAG, "Setting device volume: $newVolume/$maxVolume (normalized: $volume)")
+
+        // Update tracking to prevent echo in observer
+        lastKnownVolume = newVolume
+
+        // Set device volume (no flags = silent, no UI popup)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
     }
 
     /**
@@ -861,8 +1120,10 @@ class PlaybackService : MediaLibraryService() {
         val syncStats = SyncStats(
             playbackState = audioStats.playbackState,
             isPlaying = audioStats.isPlaying,
-            syncErrorUs = audioStats.smoothedSyncErrorUs,
-            trueSyncErrorUs = audioStats.trueSyncErrorUs,
+            syncErrorUs = audioStats.syncErrorUs,
+            smoothedSyncErrorUs = audioStats.smoothedSyncErrorUs,
+            startTimeCalibrated = audioStats.startTimeCalibrated,
+            samplesReadSinceStart = audioStats.samplesReadSinceStart,
             queuedSamples = audioStats.queuedSamples,
             chunksReceived = audioStats.chunksReceived,
             chunksPlayed = audioStats.chunksPlayed,
@@ -876,14 +1137,11 @@ class PlaybackService : MediaLibraryService() {
             framesInserted = audioStats.framesInserted,
             framesDropped = audioStats.framesDropped,
             syncCorrections = audioStats.syncCorrections,
-            correctionErrorUs = audioStats.correctionErrorUs,
             clockReady = timeFilter.isReady,
             clockOffsetUs = timeFilter.offsetMicros,
             clockErrorUs = timeFilter.errorMicros,
             measurementCount = timeFilter.measurementCountValue,
-            dacCalibrationCount = audioStats.dacCalibrationCount,
             totalFramesWritten = audioStats.totalFramesWritten,
-            lastKnownPlaybackPositionUs = audioStats.lastKnownPlaybackPositionUs,
             serverTimelineCursorUs = audioStats.serverTimelineCursorUs,
             scheduledStartLoopTimeUs = audioStats.scheduledStartLoopTimeUs,
             firstServerTimestampUs = audioStats.firstServerTimestampUs
@@ -979,7 +1237,19 @@ class PlaybackService : MediaLibraryService() {
 
         forwardingPlayer = MetadataForwardingPlayer(player)
 
+        // Create PendingIntent for notification tap - opens MainActivity
+        val sessionActivityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val sessionActivityPendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            sessionActivityIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         mediaSession = MediaLibrarySession.Builder(this, forwardingPlayer!!, LibraryCallback())
+            .setSessionActivity(sessionActivityPendingIntent)
             .build()
 
         Log.d(TAG, "MediaLibrarySession initialized with browse tree support")
@@ -1093,6 +1363,7 @@ class PlaybackService : MediaLibraryService() {
                 .add(SessionCommand(COMMAND_SET_VOLUME, Bundle.EMPTY))
                 .add(SessionCommand(COMMAND_NEXT, Bundle.EMPTY))
                 .add(SessionCommand(COMMAND_PREVIOUS, Bundle.EMPTY))
+                .add(SessionCommand(COMMAND_SWITCH_GROUP, Bundle.EMPTY))
                 .add(SessionCommand(COMMAND_GET_STATS, Bundle.EMPTY))
                 .build()
 
@@ -1159,6 +1430,12 @@ class PlaybackService : MediaLibraryService() {
                     Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
 
+                COMMAND_SWITCH_GROUP -> {
+                    Log.d(TAG, "Switch group command received")
+                    sendSpinClient?.switchGroup()
+                    Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
+
                 COMMAND_GET_STATS -> {
                     val statsBundle = getStats()
                     Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS, statsBundle))
@@ -1179,6 +1456,17 @@ class PlaybackService : MediaLibraryService() {
     private fun getStats(): Bundle {
         val bundle = Bundle()
 
+        // Get connection info from SendSpinClient
+        sendSpinClient?.let { client ->
+            bundle.putString("server_name", client.getServerName())
+            bundle.putString("server_address", client.getServerAddress())
+            bundle.putString("connection_state", client.connectionState.value.toString())
+            bundle.putString("audio_codec", currentCodec.uppercase())
+        } ?: run {
+            bundle.putString("connection_state", "Disconnected")
+            bundle.putString("audio_codec", "--")
+        }
+
         // Get stats from SyncAudioPlayer
         val audioStats = syncAudioPlayer?.getStats()
         if (audioStats != null) {
@@ -1186,9 +1474,18 @@ class PlaybackService : MediaLibraryService() {
             bundle.putString("playback_state", audioStats.playbackState.name)
             bundle.putBoolean("is_playing", audioStats.isPlaying)
 
-            // Sync status
-            bundle.putLong("sync_error_us", audioStats.smoothedSyncErrorUs)
-            bundle.putLong("true_sync_error_us", audioStats.trueSyncErrorUs)
+            // Sync error
+            bundle.putLong("sync_error_us", audioStats.syncErrorUs)
+            bundle.putLong("smoothed_sync_error_us", audioStats.smoothedSyncErrorUs)
+            bundle.putDouble("sync_error_drift", audioStats.syncErrorDrift)
+            bundle.putLong("grace_period_remaining_us", audioStats.gracePeriodRemainingUs)
+
+            // DAC/Audio
+            bundle.putBoolean("start_time_calibrated", audioStats.startTimeCalibrated)
+            bundle.putInt("dac_calibration_count", audioStats.dacCalibrationCount)
+            bundle.putLong("samples_read_since_start", audioStats.samplesReadSinceStart)
+            bundle.putLong("total_frames_written", audioStats.totalFramesWritten)
+            bundle.putLong("buffer_underrun_count", audioStats.bufferUnderrunCount)
 
             // Buffer
             bundle.putLong("queued_samples", audioStats.queuedSamples)
@@ -1206,12 +1503,9 @@ class PlaybackService : MediaLibraryService() {
             bundle.putLong("frames_inserted", audioStats.framesInserted)
             bundle.putLong("frames_dropped", audioStats.framesDropped)
             bundle.putLong("sync_corrections", audioStats.syncCorrections)
-            bundle.putLong("correction_error_us", audioStats.correctionErrorUs)
+            bundle.putLong("reanchor_count", audioStats.reanchorCount)
 
-            // DAC calibration
-            bundle.putInt("dac_calibration_count", audioStats.dacCalibrationCount)
-            bundle.putLong("total_frames_written", audioStats.totalFramesWritten)
-            bundle.putLong("last_known_playback_position_us", audioStats.lastKnownPlaybackPositionUs)
+            // Playback tracking
             bundle.putLong("server_timeline_cursor_us", audioStats.serverTimelineCursorUs)
 
             // Timing
@@ -1231,9 +1525,25 @@ class PlaybackService : MediaLibraryService() {
         sendSpinClient?.let { client ->
             val timeFilter = client.getTimeFilter()
             bundle.putBoolean("clock_ready", timeFilter.isReady)
+            bundle.putBoolean("clock_converged", timeFilter.isConverged)
             bundle.putLong("clock_offset_us", timeFilter.offsetMicros)
+            bundle.putDouble("clock_drift_ppm", timeFilter.driftPpm)
             bundle.putLong("clock_error_us", timeFilter.errorMicros)
             bundle.putInt("measurement_count", timeFilter.measurementCountValue)
+            bundle.putLong("last_time_sync_age_ms", client.getLastTimeSyncAgeMs())
+        }
+
+        // Get network stats from NetworkEvaluator
+        networkEvaluator?.networkState?.value?.let { netState ->
+            bundle.putString("network_type", netState.transportType.name)
+            bundle.putString("network_quality", netState.quality.name)
+            bundle.putBoolean("network_metered", netState.isMetered)
+            bundle.putBoolean("network_connected", netState.isConnected)
+            netState.wifiRssi?.let { bundle.putInt("wifi_rssi", it) }
+            netState.wifiLinkSpeedMbps?.let { bundle.putInt("wifi_link_speed", it) }
+            netState.wifiFrequencyMhz?.let { bundle.putInt("wifi_frequency", it) }
+            netState.cellularType?.let { bundle.putString("cellular_type", it.name) }
+            netState.downstreamBandwidthKbps?.let { bundle.putInt("bandwidth_down_kbps", it) }
         }
 
         return bundle
@@ -1423,10 +1733,16 @@ class PlaybackService : MediaLibraryService() {
         // Unregister network callback
         unregisterNetworkCallback()
 
-        serviceScope.cancel()
-        imageLoader.shutdown()
+        // Unregister volume observer
+        volumeObserver?.let { contentResolver.unregisterContentObserver(it) }
+        volumeObserver = null
 
-        // Release audio player and wake lock
+        serviceScope.cancel()
+        imageLoader?.shutdown()
+
+        // Release audio decoder and player, then wake lock
+        audioDecoder?.release()
+        audioDecoder = null
         syncAudioPlayer?.release()
         syncAudioPlayer = null
         releaseWakeLock()

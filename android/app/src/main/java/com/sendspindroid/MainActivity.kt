@@ -3,7 +3,11 @@ package com.sendspindroid
 import android.Manifest
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.database.ContentObserver
+import android.media.AudioManager
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -79,11 +83,20 @@ class MainActivity : AppCompatActivity() {
     private var showManualButtonRunnable: Runnable? = null
     private var countdownRunnable: Runnable? = null
 
+    // Reconnecting indicator - persists while reconnection is in progress
+    private var reconnectingSnackbar: Snackbar? = null
+
     // Network state monitoring
     private val connectivityManager by lazy {
         getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    // Volume control - uses device STREAM_MUSIC (Spotify-style)
+    private val audioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+    private var volumeObserver: ContentObserver? = null
 
     // Permission request launcher for POST_NOTIFICATIONS (Android 13+)
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -243,6 +256,57 @@ class MainActivity : AppCompatActivity() {
         ).show()
     }
 
+    /**
+     * Shows an indicator that we're reconnecting to the server.
+     * Playback continues from buffer during this time.
+     *
+     * @param attempt Current reconnection attempt number
+     * @param bufferMs Remaining audio buffer in milliseconds
+     */
+    private fun showReconnectingIndicator(attempt: Int, bufferMs: Long) {
+        // Don't show UI if activity is finishing or destroyed
+        if (isFinishing || isDestroyed) {
+            return
+        }
+
+        // Dismiss any existing reconnecting snackbar
+        reconnectingSnackbar?.dismiss()
+
+        val bufferSec = bufferMs / 1000
+        val message = if (bufferSec > 0) {
+            "Reconnecting (attempt $attempt)... ${bufferSec}s buffer"
+        } else {
+            "Reconnecting (attempt $attempt)..."
+        }
+
+        try {
+            reconnectingSnackbar = Snackbar.make(
+                binding.coordinatorLayout,
+                message,
+                Snackbar.LENGTH_INDEFINITE
+            ).apply {
+                // Use warning/info color instead of error
+                view.setBackgroundColor(
+                    ContextCompat.getColor(this@MainActivity, com.google.android.material.R.color.design_default_color_primary)
+                )
+                show()
+            }
+
+            // Announce for accessibility
+            announceForAccessibility("Reconnecting to server. Playback continuing from buffer.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to show reconnecting indicator", e)
+        }
+    }
+
+    /**
+     * Hides the reconnecting indicator (on successful reconnection or error).
+     */
+    private fun hideReconnectingIndicator() {
+        reconnectingSnackbar?.dismiss()
+        reconnectingSnackbar = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -357,7 +421,14 @@ class MainActivity : AppCompatActivity() {
             onNextClicked()
         }
 
-        // Volume slider with accessibility updates and haptic feedback
+        binding.switchGroupButton.setOnClickListener {
+            onSwitchGroupClicked()
+        }
+
+        // Volume slider - controls device STREAM_MUSIC (Spotify-style)
+        // Initialize slider to current device volume
+        syncSliderWithDeviceVolume()
+
         binding.volumeSlider.addOnChangeListener { slider, value, fromUser ->
             if (fromUser) {
                 onVolumeChanged(value / 100f)
@@ -383,11 +454,40 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         registerNetworkCallback()
+        registerVolumeObserver()
     }
 
     override fun onStop() {
         super.onStop()
         unregisterNetworkCallback()
+        unregisterVolumeObserver()
+    }
+
+    /**
+     * Called when activity comes to foreground.
+     * Re-syncs UI with current playback state to handle cases where:
+     * - User returns from another app
+     * - Screen was turned off and on
+     * - Activity was in background while playback continued
+     */
+    override fun onResume() {
+        super.onResume()
+        // Re-sync UI state with MediaController
+        syncUIWithPlayerState()
+        // Re-sync volume slider with device volume (may have changed while in background)
+        syncSliderWithDeviceVolume()
+    }
+
+    /**
+     * Called when activity receives a new intent while already running.
+     * This happens when user taps the notification (FLAG_ACTIVITY_SINGLE_TOP).
+     * Without this, the activity doesn't know it was re-launched and UI can get stuck.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // Re-sync UI state with MediaController
+        syncUIWithPlayerState()
     }
 
     // ============================================================================
@@ -521,13 +621,14 @@ class MainActivity : AppCompatActivity() {
     /**
      * Shows the now playing view (album art, playback controls).
      * Called when connected to a server.
-     * Connection status is shown in the toolbar subtitle.
      */
     private fun showNowPlayingView(serverName: String) {
         cancelManualButtonTimeout()
 
-        // Show server name in toolbar subtitle
-        supportActionBar?.subtitle = serverName
+        // Set toolbar state based on current playing state, no subtitle
+        val isPlaying = mediaController?.isPlaying == true
+        supportActionBar?.title = if (isPlaying) "Playing" else "Paused"
+        supportActionBar?.subtitle = null
 
         binding.searchingView.visibility = View.GONE
         binding.manualEntryView.visibility = View.GONE
@@ -539,6 +640,12 @@ class MainActivity : AppCompatActivity() {
         binding.nowPlayingView.visibility = View.VISIBLE
         binding.nowPlayingContent.visibility = View.VISIBLE
         binding.connectionProgressContainer.visibility = View.GONE
+
+        // Sync volume slider with current device volume
+        syncSliderWithDeviceVolume()
+
+        // Sync play/pause button with current state
+        updatePlayPauseButton(isPlaying)
     }
 
     /**
@@ -804,6 +911,13 @@ class MainActivity : AppCompatActivity() {
                     binding.volumeSlider.value = volume.toFloat()
                     updateVolumeAccessibility(volume)
                 }
+
+                // Handle group name updates
+                val groupName = extras.getString(PlaybackService.EXTRA_GROUP_NAME)
+                if (groupName != null) {
+                    Log.d(TAG, "Group name update received: $groupName")
+                    updateGroupName(groupName)
+                }
             }
         }
     }
@@ -813,6 +927,12 @@ class MainActivity : AppCompatActivity() {
      * Updates the UI state machine based on the connection state.
      */
     private fun handleConnectionStateChange(stateStr: String, extras: Bundle) {
+        // Don't update UI if activity is finishing or destroyed
+        if (isFinishing || isDestroyed) {
+            Log.d(TAG, "Ignoring connection state change - activity finishing/destroyed")
+            return
+        }
+
         Log.d(TAG, "Connection state changed: $stateStr")
 
         when (stateStr) {
@@ -826,17 +946,47 @@ class MainActivity : AppCompatActivity() {
                 val serverName = extras.getString(PlaybackService.EXTRA_SERVER_NAME, "Unknown Server")
                 Log.d(TAG, "Connected to: $serverName")
 
-                // Get address from current connecting state, or use empty string
-                val address = (connectionState as? AppConnectionState.Connecting)?.serverAddress ?: ""
+                // Get address from current connecting state or reconnecting state
+                val address = when (val currentState = connectionState) {
+                    is AppConnectionState.Connecting -> currentState.serverAddress
+                    is AppConnectionState.Reconnecting -> currentState.serverAddress
+                    else -> ""
+                }
 
                 connectionState = AppConnectionState.Connected(serverName, address)
                 showNowPlayingView(serverName)
                 enablePlaybackControls(true)
                 hideConnectionLoading()
+                hideReconnectingIndicator()  // Hide any reconnecting indicator
                 invalidateOptionsMenu() // Show "Switch Server" menu option
 
                 // Announce connection for accessibility
                 announceForAccessibility(getString(R.string.accessibility_connected))
+            }
+            PlaybackService.STATE_RECONNECTING -> {
+                val serverName = extras.getString(PlaybackService.EXTRA_SERVER_NAME, "Unknown Server")
+                val attempt = extras.getInt("reconnect_attempt", 1)
+                val bufferMs = extras.getLong("buffer_remaining_ms", 0)
+                Log.d(TAG, "Reconnecting to: $serverName (attempt $attempt, buffer ${bufferMs}ms)")
+
+                // Preserve server address from previous state
+                val address = when (val currentState = connectionState) {
+                    is AppConnectionState.Connected -> currentState.serverAddress
+                    is AppConnectionState.Reconnecting -> currentState.serverAddress
+                    else -> ""
+                }
+
+                connectionState = AppConnectionState.Reconnecting(
+                    serverName = serverName,
+                    serverAddress = address,
+                    attempt = attempt,
+                    nextRetrySeconds = (1 shl (attempt - 1)).coerceAtMost(30)
+                )
+
+                // Show reconnecting indicator without disrupting playback view
+                showReconnectingIndicator(attempt, bufferMs)
+
+                // Keep playback controls enabled - playback continues from buffer
             }
             PlaybackService.STATE_DISCONNECTED -> {
                 Log.d(TAG, "Disconnected from server")
@@ -968,6 +1118,8 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Syncs UI with current player state when controller connects.
+     * Also restores the correct view (now playing vs searching) based on playback state.
+     * Called from onResume(), onNewIntent(), and when MediaController first connects.
      */
     private fun syncUIWithPlayerState() {
         mediaController?.let { controller ->
@@ -975,21 +1127,44 @@ class MainActivity : AppCompatActivity() {
             val state = controller.playbackState
 
             runOnUiThread {
-                when {
-                    isPlaying -> {
+                // Check if we're actively connected (playing or ready to play)
+                val isConnected = isPlaying || state == Player.STATE_READY || state == Player.STATE_BUFFERING
+
+                if (isConnected) {
+                    // Restore connection state if needed (e.g., after activity recreation)
+                    // Don't overwrite Reconnecting state - it's still valid while playing from buffer
+                    if (connectionState !is AppConnectionState.Connected &&
+                        connectionState !is AppConnectionState.Reconnecting) {
+                        // Get server name from toolbar subtitle or use default
+                        val serverName = supportActionBar?.subtitle?.toString() ?: "Connected"
+                        connectionState = AppConnectionState.Connected(serverName, "")
+                        showNowPlayingView(serverName)
+                        invalidateOptionsMenu()
+                    }
+
+                    // Update playback state
+                    if (isPlaying) {
                         updatePlaybackState("playing")
-                        enablePlaybackControls(true)
-                    }
-                    state == Player.STATE_READY -> {
+                    } else {
                         updatePlaybackState("paused")
-                        enablePlaybackControls(true)
                     }
-                    else -> {
-                        enablePlaybackControls(false)
+                    enablePlaybackControls(true)
+                } else {
+                    enablePlaybackControls(false)
+
+                    // If we were showing connected/connecting state but player is now disconnected,
+                    // transition back to manual entry view to prevent stale UI state
+                    if (connectionState is AppConnectionState.Connected ||
+                        connectionState is AppConnectionState.Reconnecting ||
+                        connectionState is AppConnectionState.Connecting) {
+                        Log.d(TAG, "Player disconnected but UI shows connected - resetting to manual entry")
+                        connectionState = AppConnectionState.ManualEntry
+                        showManualEntryView()
+                        invalidateOptionsMenu()
                     }
                 }
 
-                // Sync play/pause button text
+                // Sync play/pause button icon
                 updatePlayPauseButton(isPlaying)
 
                 // Sync metadata and artwork
@@ -1155,6 +1330,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Handles switch group button click.
+     * Sends switch group command to PlaybackService to cycle to next available group.
+     */
+    private fun onSwitchGroupClicked() {
+        Log.d(TAG, "Switch group clicked")
+        val controller = mediaController ?: return
+        val command = SessionCommand(PlaybackService.COMMAND_SWITCH_GROUP, Bundle.EMPTY)
+        controller.sendCustomCommand(command, Bundle.EMPTY)
+    }
+
+    /**
      * Handles disconnect button click.
      * Shows confirmation dialog before disconnecting.
      */
@@ -1194,18 +1380,76 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Handles volume slider changes.
-     * Sends SET_VOLUME command to PlaybackService via MediaController.
+     *
+     * Sets device STREAM_MUSIC volume directly (Spotify-style) AND syncs to server
+     * via PlaybackService custom command for multi-client coordination.
+     *
+     * @param volume Normalized volume from 0.0 to 1.0
      */
     private fun onVolumeChanged(volume: Float) {
         Log.d(TAG, "Volume changed: $volume")
 
-        val controller = mediaController ?: return
+        // Set device volume directly (Spotify-style)
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val newVolume = (volume * maxVolume).toInt().coerceIn(0, maxVolume)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
 
+        // Also notify PlaybackService to sync to server (for multi-client coordination)
+        val controller = mediaController ?: return
         val args = Bundle().apply {
             putFloat(PlaybackService.ARG_VOLUME, volume)
         }
         val command = SessionCommand(PlaybackService.COMMAND_SET_VOLUME, Bundle.EMPTY)
         controller.sendCustomCommand(command, args)
+    }
+
+    /**
+     * Syncs the volume slider with the current device STREAM_MUSIC volume.
+     * Called on startup and when returning from background.
+     */
+    private fun syncSliderWithDeviceVolume() {
+        // Safety check - observer callback can fire during lifecycle transitions
+        if (!::binding.isInitialized) return
+
+        val currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        // Round to nearest integer - slider has stepSize=1.0 and crashes on decimal values
+        val sliderValue = ((currentVolume.toFloat() / maxVolume) * 100).toInt().toFloat()
+        binding.volumeSlider.value = sliderValue
+        Log.d(TAG, "Synced slider with device volume: $currentVolume/$maxVolume ($sliderValue%)")
+    }
+
+    /**
+     * Registers a ContentObserver to detect device volume changes from hardware buttons.
+     * This keeps the UI slider in sync when user presses hardware volume buttons.
+     */
+    private fun registerVolumeObserver() {
+        if (volumeObserver != null) return  // Already registered
+
+        volumeObserver = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean) {
+                // Sync slider to device volume when hardware buttons are pressed
+                syncSliderWithDeviceVolume()
+            }
+        }
+
+        contentResolver.registerContentObserver(
+            Settings.System.CONTENT_URI,
+            true,
+            volumeObserver!!
+        )
+        Log.d(TAG, "Volume observer registered")
+    }
+
+    /**
+     * Unregisters the volume ContentObserver.
+     */
+    private fun unregisterVolumeObserver() {
+        volumeObserver?.let {
+            contentResolver.unregisterContentObserver(it)
+            volumeObserver = null
+            Log.d(TAG, "Volume observer unregistered")
+        }
     }
 
     /**
@@ -1275,11 +1519,26 @@ class MainActivity : AppCompatActivity() {
         binding.previousButton.isEnabled = enabled
         binding.playPauseButton.isEnabled = enabled
         binding.nextButton.isEnabled = enabled
+        binding.switchGroupButton.isEnabled = enabled
         binding.volumeSlider.isEnabled = enabled
     }
 
+    /**
+     * Updates the group name display.
+     * Shows the group name TextView if a group name is provided, hides it otherwise.
+     */
+    private fun updateGroupName(groupName: String) {
+        if (groupName.isNotEmpty()) {
+            binding.groupNameText.text = getString(R.string.group_label, groupName)
+            binding.groupNameText.visibility = View.VISIBLE
+        } else {
+            binding.groupNameText.visibility = View.GONE
+        }
+    }
+
     private fun updatePlaybackState(state: String) {
-        binding.nowPlayingText.text = when (state) {
+        // Show playback state in the toolbar title
+        supportActionBar?.title = when (state) {
             "playing" -> "Playing"
             "paused" -> "Paused"
             "stopped" -> "Stopped"
@@ -1289,27 +1548,30 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Updates the play/pause button icon and content description based on playing state.
+     * Also updates toolbar title to keep UI in sync.
      * Shows pause icon when playing, play icon when paused.
      */
     private fun updatePlayPauseButton(isPlaying: Boolean) {
         if (isPlaying) {
             binding.playPauseButton.setIconResource(R.drawable.ic_pause)
             binding.playPauseButton.contentDescription = getString(R.string.accessibility_pause_button)
+            supportActionBar?.title = "Playing"
         } else {
             binding.playPauseButton.setIconResource(R.drawable.ic_play)
             binding.playPauseButton.contentDescription = getString(R.string.accessibility_play_button)
+            supportActionBar?.title = "Paused"
         }
     }
 
     private fun updateMetadata(title: String, artist: String, album: String) {
+        // Song title goes in the large text field
+        binding.nowPlayingText.text = if (title.isNotEmpty()) title else getString(R.string.not_playing)
+
+        // Artist and album info in the smaller metadata field
         val metadata = buildString {
-            if (title.isNotEmpty()) append(title)
-            if (artist.isNotEmpty()) {
-                if (isNotEmpty()) append(" - ")
-                append(artist)
-            }
+            if (artist.isNotEmpty()) append(artist)
             if (album.isNotEmpty()) {
-                if (isNotEmpty()) append("\n")
+                if (isNotEmpty()) append(" \u2022 ")  // bullet separator
                 append(album)
             }
         }
@@ -1386,8 +1648,16 @@ class MainActivity : AppCompatActivity() {
     /**
      * Loads artwork from a URL using Coil.
      * Called when we receive artwork URL via session extras.
+     * Skipped in low memory mode - shows placeholder instead.
      */
     private fun loadArtworkFromUrl(url: String) {
+        // Skip artwork loading in low memory mode
+        if (UserSettings.lowMemoryMode) {
+            binding.albumArtView.setImageResource(R.drawable.placeholder_album)
+            resetSliderColors()
+            return
+        }
+
         Log.d(TAG, "Loading artwork from URL: $url")
         binding.albumArtView.load(url) {
             crossfade(true)
@@ -1408,12 +1678,19 @@ class MainActivity : AppCompatActivity() {
     /**
      * Extracts dominant colors from artwork and applies them to UI elements.
      * Uses the Palette library to analyze the image.
+     * Skipped in low memory mode to save memory.
      *
      * Applies colors to:
      * - Volume slider (vibrant/muted color)
      * - Background (dark muted color for ambient effect)
      */
     private fun extractAndApplyColors(bitmap: Bitmap) {
+        // Skip Palette extraction in low memory mode
+        if (UserSettings.lowMemoryMode) {
+            resetSliderColors()
+            return
+        }
+
         Palette.from(bitmap).generate { palette ->
             palette?.let {
                 // Get the vibrant swatch for slider, or fall back to muted, then dominant
@@ -1444,8 +1721,9 @@ class MainActivity : AppCompatActivity() {
                     ContextCompat.getColor(this, R.color.md_theme_dark_background)
                 }
 
-                binding.nowPlayingView.setBackgroundColor(backgroundColor)
-                Log.d(TAG, "Applied background color: ${Integer.toHexString(backgroundColor)}")
+                // Apply background color to entire window (root CoordinatorLayout)
+                binding.coordinatorLayout.setBackgroundColor(backgroundColor)
+                Log.d(TAG, "Applied background color to window: ${Integer.toHexString(backgroundColor)}")
             }
         }
     }
@@ -1472,9 +1750,9 @@ class MainActivity : AppCompatActivity() {
         binding.volumeSlider.trackActiveTintList = ColorStateList.valueOf(primaryColor)
         binding.volumeSlider.thumbTintList = ColorStateList.valueOf(primaryColor)
 
-        // Reset background to default theme color
+        // Reset background to default theme color for entire window
         val backgroundColor = ContextCompat.getColor(this, R.color.md_theme_dark_background)
-        binding.nowPlayingView.setBackgroundColor(backgroundColor)
+        binding.coordinatorLayout.setBackgroundColor(backgroundColor)
     }
 
     /**
