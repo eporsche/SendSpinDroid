@@ -1055,10 +1055,11 @@ class SendSpinClient(
         // Extract metadata if present
         val metadata = payload.optJSONObject("metadata")
         if (metadata != null) {
-            val title = metadata.optString("title", "")
-            val artist = metadata.optString("artist", "")
-            val album = metadata.optString("album", "")
-            val artworkUrl = metadata.optString("artwork_url", "")
+            // Note: optString returns literal "null" when JSON has null value, so we filter it
+            val title = metadata.optString("title", "").takeUnless { it == "null" } ?: ""
+            val artist = metadata.optString("artist", "").takeUnless { it == "null" } ?: ""
+            val album = metadata.optString("album", "").takeUnless { it == "null" } ?: ""
+            val artworkUrl = metadata.optString("artwork_url", "").takeUnless { it == "null" } ?: ""
             val durationMs = metadata.optLong("duration_ms", 0)
             val positionMs = metadata.optLong("position_ms", 0)
 
@@ -1071,14 +1072,10 @@ class SendSpinClient(
             callback.onStateChanged(state)
         }
 
-        // Extract volume if present (0-100)
-        if (payload.has("volume")) {
-            val volume = payload.optInt("volume", -1)
-            if (volume in 0..100) {
-                Log.d(TAG, "Server volume update: $volume%")
-                callback.onVolumeChanged(volume)
-            }
-        }
+        // Note: server/state may contain a "volume" field, but per SendSpin protocol spec,
+        // this is the GROUP AVERAGE volume for controller role clients, not the player's
+        // individual volume. Players receive volume commands via server/command messages.
+        // We intentionally don't process volume from server/state to avoid UI desync.
     }
 
     /**
@@ -1171,14 +1168,8 @@ class SendSpinClient(
         Log.d(TAG, "group/update: id=$groupId, name=$groupName, state=$playbackState")
         callback.onGroupUpdate(groupId, groupName, playbackState)
 
-        // Check for volume in group/update as well
-        if (payload.has("volume")) {
-            val volume = payload.optInt("volume", -1)
-            if (volume in 0..100) {
-                Log.d(TAG, "Group volume update: $volume%")
-                callback.onVolumeChanged(volume)
-            }
-        }
+        // Note: Per SendSpin protocol spec, group/update does not contain volume data.
+        // Player volume is controlled exclusively via server/command messages.
     }
 
     /**
